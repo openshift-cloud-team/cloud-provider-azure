@@ -53,8 +53,6 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/configloader"
 	azclients "sigs.k8s.io/cloud-provider-azure/pkg/azureclients"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/blobclient"
-	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/containerserviceclient"
-	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/deploymentclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/diskclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/fileclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/interfaceclient"
@@ -63,10 +61,7 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/privateendpointclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/privatelinkserviceclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/publicipclient"
-	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/routeclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/routetableclient"
-	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/securitygroupclient"
-	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/snapshotclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/storageaccountclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/subnetclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/vmasclient"
@@ -81,6 +76,7 @@ import (
 	azcache "sigs.k8s.io/cloud-provider-azure/pkg/cache"
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	ratelimitconfig "sigs.k8s.io/cloud-provider-azure/pkg/provider/config"
+	"sigs.k8s.io/cloud-provider-azure/pkg/provider/securitygroup"
 	"sigs.k8s.io/cloud-provider-azure/pkg/retry"
 	utilsets "sigs.k8s.io/cloud-provider-azure/pkg/util/sets"
 	"sigs.k8s.io/cloud-provider-azure/pkg/util/taints"
@@ -359,17 +355,14 @@ type Cloud struct {
 	Config
 	Environment azure.Environment
 
-	RoutesClient                    routeclient.Interface
 	SubnetsClient                   subnetclient.Interface
 	InterfacesClient                interfaceclient.Interface
 	RouteTablesClient               routetableclient.Interface
 	LoadBalancerClient              loadbalancerclient.Interface
 	PublicIPAddressesClient         publicipclient.Interface
-	SecurityGroupsClient            securitygroupclient.Interface
 	VirtualMachinesClient           vmclient.Interface
 	StorageAccountClient            storageaccountclient.Interface
 	DisksClient                     diskclient.Interface
-	SnapshotsClient                 snapshotclient.Interface
 	FileClient                      fileclient.Interface
 	BlobClient                      blobclient.Interface
 	VirtualMachineScaleSetsClient   vmssclient.Interface
@@ -380,8 +373,6 @@ type Cloud struct {
 	privateendpointclient           privateendpointclient.Interface
 	privatednszonegroupclient       privatednszonegroupclient.Interface
 	PrivateLinkServiceClient        privatelinkserviceclient.Interface
-	containerServiceClient          containerserviceclient.Interface
-	deploymentClient                deploymentclient.Interface
 	ComputeClientFactory            azclient.ClientFactory
 	NetworkClientFactory            azclient.ClientFactory
 	AuthProvider                    *azclient.AuthProvider
@@ -425,10 +416,10 @@ type Cloud struct {
 	routeUpdater       batchProcessor
 	backendPoolUpdater batchProcessor
 
-	vmCache  azcache.Resource
-	lbCache  azcache.Resource
-	nsgCache azcache.Resource
-	rtCache  azcache.Resource
+	vmCache azcache.Resource
+	lbCache azcache.Resource
+	nsgRepo securitygroup.Repository
+	rtCache azcache.Resource
 	// public ip cache
 	// key: [resourceGroupName]
 	// Value: sync.Map of [pipName]*PublicIPAddress
@@ -455,10 +446,12 @@ type Cloud struct {
 	multipleStandardLoadBalancersActiveNodesLock    sync.Mutex
 	localServiceNameToServiceInfoMap                sync.Map
 	endpointSlicesCache                             sync.Map
+
+	azureResourceLocker *AzureResourceLocker
 }
 
 // NewCloud returns a Cloud with initialized clients
-func NewCloud(ctx context.Context, config *Config, callFromCCM bool) (cloudprovider.Interface, error) {
+func NewCloud(ctx context.Context, clientBuilder cloudprovider.ControllerClientBuilder, config *Config, callFromCCM bool) (cloudprovider.Interface, error) {
 	az := &Cloud{
 		nodeNames:                  utilsets.NewString(),
 		nodeZones:                  map[string]*utilsets.IgnoreCaseSet{},
@@ -479,10 +472,22 @@ func NewCloud(ctx context.Context, config *Config, callFromCCM bool) (cloudprovi
 	if az.lockMap == nil {
 		az.lockMap = newLockMap()
 	}
+
+	if clientBuilder != nil {
+		az.KubeClient = clientBuilder.ClientOrDie("azure-cloud-provider")
+	}
+	az.azureResourceLocker = NewAzureResourceLocker(
+		az,
+		consts.AzureResourceLockHolderNameCloudControllerManager,
+		consts.AzureResourceLockLeaseName,
+		consts.AzureResourceLockLeaseNamespace,
+		consts.AzureResourceLockLeaseDuration,
+	)
+
 	return az, nil
 }
 
-func NewCloudFromConfigFile(ctx context.Context, configFilePath string, calFromCCM bool) (cloudprovider.Interface, error) {
+func NewCloudFromConfigFile(ctx context.Context, clientBuilder cloudprovider.ControllerClientBuilder, configFilePath string, calFromCCM bool) (cloudprovider.Interface, error) {
 	var (
 		cloud cloudprovider.Interface
 		err   error
@@ -503,8 +508,7 @@ func NewCloudFromConfigFile(ctx context.Context, configFilePath string, calFromC
 			klog.Fatalf("Failed to parse Azure cloud provider config: %v", err)
 		}
 	}
-	cloud, err = NewCloud(ctx, configValue, calFromCCM && configFilePath != "")
-
+	cloud, err = NewCloud(ctx, clientBuilder, configValue, calFromCCM && configFilePath != "")
 	if err != nil {
 		return nil, fmt.Errorf("could not init cloud provider azure: %w", err)
 	}
@@ -527,7 +531,7 @@ func NewCloudFromSecret(ctx context.Context, clientBuilder cloudprovider.Control
 	if err != nil {
 		return nil, fmt.Errorf("NewCloudFromSecret: failed to get config from secret %s/%s: %w", secretNamespace, secretName, err)
 	}
-	az, err := NewCloud(ctx, config, true)
+	az, err := NewCloud(ctx, clientBuilder, config, true)
 	if err != nil {
 		return nil, fmt.Errorf("NewCloudFromSecret: failed to initialize cloud from secret %s/%s: %w", secretNamespace, secretName, err)
 	}
@@ -642,12 +646,12 @@ func (az *Cloud) InitializeCloudFromConfig(ctx context.Context, config *Config, 
 	}
 
 	if strings.EqualFold(consts.VMTypeVMSS, az.Config.VMType) {
-		az.VMSet, err = newScaleSet(ctx, az)
+		az.VMSet, err = newScaleSet(az)
 		if err != nil {
 			return err
 		}
 	} else if strings.EqualFold(consts.VMTypeVmssFlex, az.Config.VMType) {
-		az.VMSet, err = newFlexScaleSet(ctx, az)
+		az.VMSet, err = newFlexScaleSet(az)
 		if err != nil {
 			return err
 		}
@@ -729,8 +733,16 @@ func (az *Cloud) InitializeCloudFromConfig(ctx context.Context, config *Config, 
 		if err != nil {
 			return err
 		}
-	}
 
+		networkClientFactory := az.NetworkClientFactory
+		if networkClientFactory == nil {
+			networkClientFactory = az.ComputeClientFactory
+		}
+		az.nsgRepo, err = securitygroup.NewSecurityGroupRepo(az.SecurityGroupResourceGroup, az.SecurityGroupName, az.NsgCacheTTLInSeconds, az.DisableAPICallCache, networkClientFactory.GetSecurityGroupClient())
+		if err != nil {
+			return err
+		}
+	}
 	err = az.initCaches()
 	if err != nil {
 		return err
@@ -765,7 +777,7 @@ func (az *Cloud) InitializeCloudFromConfig(ctx context.Context, config *Config, 
 		// https://docs.microsoft.com/en-us/azure-stack/user/azure-stack-network-differences?view=azs-2102
 		if !az.isStackCloud() {
 			// wait for the success first time of syncing zones
-			err = az.syncRegionZonesMap()
+			err = az.syncRegionZonesMap(ctx)
 			if err != nil {
 				klog.Errorf("InitializeCloudFromConfig: failed to sync regional zones map for the first time: %s", err.Error())
 				return err
@@ -843,11 +855,6 @@ func (az *Cloud) initCaches() (err error) {
 		return err
 	}
 
-	az.nsgCache, err = az.newNSGCache()
-	if err != nil {
-		return err
-	}
-
 	az.rtCache, err = az.newRouteTableCache()
 	if err != nil {
 		return err
@@ -863,7 +870,7 @@ func (az *Cloud) initCaches() (err error) {
 		return err
 	}
 
-	getter := func(_ string) (interface{}, error) { return nil, nil }
+	getter := func(_ context.Context, _ string) (interface{}, error) { return nil, nil }
 	if az.storageAccountCache, err = azcache.NewTimedCache(time.Minute, getter, az.Config.DisableAPICallCache); err != nil {
 		return err
 	}
@@ -956,13 +963,13 @@ func (az *Cloud) setCloudProviderBackoffDefaults(config *Config) wait.Backoff {
 func (az *Cloud) configAzureClients(
 	servicePrincipalToken *adal.ServicePrincipalToken,
 	multiTenantOAuthTokenProvider adal.MultitenantOAuthTokenProvider,
-	networkResourceServicePrincipalToken adal.OAuthTokenProvider) {
+	networkResourceServicePrincipalToken adal.OAuthTokenProvider,
+) {
 	azClientConfig := az.getAzureClientConfig(servicePrincipalToken)
 
 	// Prepare AzureClientConfig for all azure clients
 	interfaceClientConfig := azClientConfig.WithRateLimiter(az.Config.InterfaceRateLimit)
 	vmSizeClientConfig := azClientConfig.WithRateLimiter(az.Config.VirtualMachineSizeRateLimit)
-	snapshotClientConfig := azClientConfig.WithRateLimiter(az.Config.SnapshotRateLimit)
 	storageAccountClientConfig := azClientConfig.WithRateLimiter(az.Config.StorageAccountRateLimit)
 	diskClientConfig := azClientConfig.WithRateLimiter(az.Config.DiskRateLimit)
 	vmClientConfig := azClientConfig.WithRateLimiter(az.Config.VirtualMachineRateLimit)
@@ -971,14 +978,10 @@ func (az *Cloud) configAzureClients(
 	// But http.StatusNotFound is retriable because of ARM replication latency.
 	vmssVMClientConfig := azClientConfig.WithRateLimiter(az.Config.VirtualMachineScaleSetRateLimit)
 	vmssVMClientConfig.Backoff = vmssVMClientConfig.Backoff.WithNonRetriableErrors([]string{consts.VmssVMNotActiveErrorMessage}).WithRetriableHTTPStatusCodes([]int{http.StatusNotFound})
-	routeClientConfig := azClientConfig.WithRateLimiter(az.Config.RouteRateLimit)
 	subnetClientConfig := azClientConfig.WithRateLimiter(az.Config.SubnetsRateLimit)
 	routeTableClientConfig := azClientConfig.WithRateLimiter(az.Config.RouteTableRateLimit)
 	loadBalancerClientConfig := azClientConfig.WithRateLimiter(az.Config.LoadBalancerRateLimit)
-	securityGroupClientConfig := azClientConfig.WithRateLimiter(az.Config.SecurityGroupRateLimit)
 	publicIPClientConfig := azClientConfig.WithRateLimiter(az.Config.PublicIPAddressRateLimit)
-	containerServiceConfig := azClientConfig.WithRateLimiter(az.Config.ContainerServiceRateLimit)
-	deploymentConfig := azClientConfig.WithRateLimiter(az.Config.DeploymentRateLimit)
 	privateDNSZoenGroupConfig := azClientConfig.WithRateLimiter(az.Config.PrivateDNSZoneGroupRateLimit)
 	privateEndpointConfig := azClientConfig.WithRateLimiter(az.Config.PrivateEndpointRateLimit)
 	privateLinkServiceConfig := azClientConfig.WithRateLimiter(az.Config.PrivateLinkServiceRateLimit)
@@ -1001,37 +1004,30 @@ func (az *Cloud) configAzureClients(
 	// If uses network resources in different AAD Tenant, update SubscriptionID and Authorizer for network resources client config
 	if networkResourceServicePrincipalToken != nil {
 		networkResourceServicePrincipalTokenAuthorizer := autorest.NewBearerAuthorizer(networkResourceServicePrincipalToken)
-		routeClientConfig.Authorizer = networkResourceServicePrincipalTokenAuthorizer
 		subnetClientConfig.Authorizer = networkResourceServicePrincipalTokenAuthorizer
 		routeTableClientConfig.Authorizer = networkResourceServicePrincipalTokenAuthorizer
 		loadBalancerClientConfig.Authorizer = networkResourceServicePrincipalTokenAuthorizer
-		securityGroupClientConfig.Authorizer = networkResourceServicePrincipalTokenAuthorizer
 		publicIPClientConfig.Authorizer = networkResourceServicePrincipalTokenAuthorizer
 	}
 
 	if az.UsesNetworkResourceInDifferentSubscription() {
-		routeClientConfig.SubscriptionID = az.Config.NetworkResourceSubscriptionID
 		subnetClientConfig.SubscriptionID = az.Config.NetworkResourceSubscriptionID
 		routeTableClientConfig.SubscriptionID = az.Config.NetworkResourceSubscriptionID
 		loadBalancerClientConfig.SubscriptionID = az.Config.NetworkResourceSubscriptionID
-		securityGroupClientConfig.SubscriptionID = az.Config.NetworkResourceSubscriptionID
 		publicIPClientConfig.SubscriptionID = az.Config.NetworkResourceSubscriptionID
 	}
 
 	// Initialize all azure clients based on client config
 	az.InterfacesClient = interfaceclient.New(interfaceClientConfig)
 	az.VirtualMachineSizesClient = vmsizeclient.New(vmSizeClientConfig)
-	az.SnapshotsClient = snapshotclient.New(snapshotClientConfig)
 	az.StorageAccountClient = storageaccountclient.New(storageAccountClientConfig)
 	az.DisksClient = diskclient.New(diskClientConfig)
 	az.VirtualMachinesClient = vmclient.New(vmClientConfig)
 	az.VirtualMachineScaleSetsClient = vmssclient.New(vmssClientConfig)
 	az.VirtualMachineScaleSetVMsClient = vmssvmclient.New(vmssVMClientConfig)
-	az.RoutesClient = routeclient.New(routeClientConfig)
 	az.SubnetsClient = subnetclient.New(subnetClientConfig)
 	az.RouteTablesClient = routetableclient.New(routeTableClientConfig)
 	az.LoadBalancerClient = loadbalancerclient.New(loadBalancerClientConfig)
-	az.SecurityGroupsClient = securitygroupclient.New(securityGroupClientConfig)
 	az.PublicIPAddressesClient = publicipclient.New(publicIPClientConfig)
 	az.FileClient = fileclient.New(fileClientConfig)
 	az.BlobClient = blobclient.New(blobClientConfig)
@@ -1039,8 +1035,6 @@ func (az *Cloud) configAzureClients(
 	az.privateendpointclient = privateendpointclient.New(privateEndpointConfig)
 	az.privatednszonegroupclient = privatednszonegroupclient.New(privateDNSZoenGroupConfig)
 	az.PrivateLinkServiceClient = privatelinkserviceclient.New(privateLinkServiceConfig)
-	az.containerServiceClient = containerserviceclient.New(containerServiceConfig)
-	az.deploymentClient = deploymentclient.New(deploymentConfig)
 
 	if az.ZoneClient == nil {
 		az.ZoneClient = zoneclient.New(zoneClientConfig)
@@ -1210,7 +1204,7 @@ func (az *Cloud) SetInformers(informerFactory informers.SharedInformerFactory) {
 			az.updateNodeCaches(node, nil)
 
 			klog.V(4).Infof("Removing node %s from VMSet cache.", node.Name)
-			_ = az.VMSet.DeleteCacheForNode(node.Name)
+			_ = az.VMSet.DeleteCacheForNode(context.Background(), node.Name)
 		},
 	})
 	az.nodeInformerSynced = nodeInformer.HasSynced
@@ -1499,7 +1493,7 @@ func isNodeReady(node *v1.Node) bool {
 }
 
 // getNodeVMSet gets the VMSet interface based on config.VMType and the real virtual machine type.
-func (az *Cloud) GetNodeVMSet(nodeName types.NodeName, crt azcache.AzureCacheReadType) (VMSet, error) {
+func (az *Cloud) GetNodeVMSet(ctx context.Context, nodeName types.NodeName, crt azcache.AzureCacheReadType) (VMSet, error) {
 	// 1. vmType is standard or vmssflex, return cloud.VMSet directly.
 	// 1.1 all the nodes in the cluster are avset nodes.
 	// 1.2 all the nodes in the cluster are vmssflex nodes.
@@ -1515,7 +1509,7 @@ func (az *Cloud) GetNodeVMSet(nodeName types.NodeName, crt azcache.AzureCacheRea
 		return nil, fmt.Errorf("error of converting vmSet (%q) to ScaleSet with vmType %q", az.VMSet, az.VMType)
 	}
 
-	vmManagementType, err := ss.getVMManagementTypeByNodeName(string(nodeName), crt)
+	vmManagementType, err := ss.getVMManagementTypeByNodeName(ctx, string(nodeName), crt)
 	if err != nil {
 		return nil, fmt.Errorf("getNodeVMSet: failed to check the node %s management type: %w", string(nodeName), err)
 	}
@@ -1532,5 +1526,4 @@ func (az *Cloud) GetNodeVMSet(nodeName types.NodeName, crt azcache.AzureCacheRea
 
 	// 5. Node is managed by vmss
 	return ss, nil
-
 }
