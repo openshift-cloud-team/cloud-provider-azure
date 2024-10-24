@@ -14,16 +14,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM --platform=linux/amd64 golang:1.23-bullseye@sha256:45b43371f21ec51276118e6806a22cbb0bca087ddd54c491fdc7149be01035d5 AS builder
+FROM --platform=linux/amd64 golang:1.23@sha256:ad5c126b5cf501a8caef751a243bb717ec204ab1aa56dc41dc11be089fafcb4f AS builder
 
 ARG ENABLE_GIT_COMMAND=true
 ARG ARCH=amd64
+
+RUN if [ "$ARCH" = "arm64" ] ; then \
+    apt-get update && apt-get install -y gcc-aarch64-linux-gnu ; \
+    elif [ "$ARCH" = "arm" ] ; then \
+    apt-get update && apt-get install -y gcc-arm-linux-gnueabihf ; \
+    fi
 
 WORKDIR /go/src/sigs.k8s.io/cloud-provider-azure
 COPY . .
 
 # Build the Go app
-RUN make bin/azure-cloud-node-manager ENABLE_GIT_COMMAND=${ENABLE_GIT_COMMAND}
+RUN make bin/azure-cloud-node-manager ENABLE_GIT_COMMAND=${ENABLE_GIT_COMMAND} ARCH=${ARCH}
 
 # Use distroless base image for a lean production container.
 # Start a new build stage.

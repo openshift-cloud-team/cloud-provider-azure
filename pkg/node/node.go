@@ -34,7 +34,7 @@ type IMDSNodeProvider struct {
 
 // NewIMDSNodeProvider creates a new IMDSNodeProvider.
 func NewIMDSNodeProvider(ctx context.Context) *IMDSNodeProvider {
-	az, err := azureprovider.NewCloud(ctx, &azureprovider.Config{
+	az, err := azureprovider.NewCloud(ctx, nil, &azureprovider.Config{
 		UseInstanceMetadata: true,
 		VMType:              "vmss",
 	}, false)
@@ -79,6 +79,6 @@ func (np *IMDSNodeProvider) GetZone(ctx context.Context, _ types.NodeName) (clou
 }
 
 // GetPlatformSubFaultDomain returns the PlatformSubFaultDomain from IMDS if set.
-func (np *IMDSNodeProvider) GetPlatformSubFaultDomain() (string, error) {
-	return np.azure.GetPlatformSubFaultDomain()
+func (np *IMDSNodeProvider) GetPlatformSubFaultDomain(ctx context.Context) (string, error) {
+	return np.azure.GetPlatformSubFaultDomain(ctx)
 }
