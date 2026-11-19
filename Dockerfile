@@ -14,12 +14,12 @@
 
 # syntax=docker/dockerfile:1
 
-FROM --platform=linux/amd64 mcr.microsoft.com/oss/go/microsoft/golang:1.26.9-1-bookworm@sha256:216bcfa984fca3ad0a98190dc61842fe910413c0b280f0bd813c9704ba71dc9c AS builder
+FROM --platform=linux/amd64 mcr.microsoft.com/oss/go/microsoft/golang:1.27.4-1-bookworm@sha256:beab7184dddd56cb4fb652a2e9affb25ce377d85f30a7c14eed0e65a7b315c4e AS builder
 
 ARG ENABLE_GIT_COMMAND=true
-ARG GOEXPERIMENT
+ARG MS_GO_NOSYSTEMCRYPTO
 ARG ARCH=amd64
-ENV GOEXPERIMENT=${GOEXPERIMENT}
+ENV MS_GO_NOSYSTEMCRYPTO=${MS_GO_NOSYSTEMCRYPTO}
 
 RUN if [ "$ARCH" = "arm64" ] ; then \
     apt-get update && apt-get install -y gcc-aarch64-linux-gnu ; \
@@ -34,6 +34,6 @@ COPY . .
 RUN --mount=type=cache,target=/root/.cache/go-build \
     make bin/azure-cloud-controller-manager ENABLE_GIT_COMMAND=${ENABLE_GIT_COMMAND} ARCH=${ARCH}
 
-FROM gcr.io/distroless/base:latest@sha256:389cad21f73e4c37b94ffe5b13736d5a92bd5bd3c6c6b38c2be1c881e14ba2bd
+FROM gcr.io/distroless/base:latest@sha256:9ef50bca108839d5986e4d84b7f7b2d79024c9293b7c35b162c6c55485bd5868
 COPY --from=builder /go/src/sigs.k8s.io/cloud-provider-azure/bin/azure-cloud-controller-manager /usr/local/bin/cloud-controller-manager
 ENTRYPOINT [ "/usr/local/bin/cloud-controller-manager" ]
